@@ -23,25 +23,68 @@ import com.amazonaws.AmazonWebServiceRequest;
 import com.amazonaws.AmazonWebServiceResponse;
 import com.amazonaws.Request;
 import com.amazonaws.Response;
+import com.amazonaws.xray.handlers.config.AWSOperationHandler;
+import com.amazonaws.xray.handlers.config.AWSOperationHandlerManifest;
+import com.amazonaws.xray.handlers.config.AWSServiceHandlerManifest;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.PropertyNamingStrategy;
 import io.grpc.Context;
 import io.opentelemetry.context.Scope;
 import io.opentelemetry.context.propagation.TextMapPropagator.Setter;
 import io.opentelemetry.instrumentation.api.tracer.HttpClientTracer;
 import io.opentelemetry.trace.Span;
+import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
 import java.net.URI;
+import java.net.URL;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class AwsSdkClientTracer extends HttpClientTracer<Request<?>, Request<?>, Response<?>> {
+
+  private static final Logger log = LoggerFactory.getLogger(AwsSdkClientTracer.class);
 
   static final String COMPONENT_NAME = "java-aws-sdk";
 
   public static final AwsSdkClientTracer TRACER = new AwsSdkClientTracer();
 
+  private static final ObjectMapper MAPPER = new ObjectMapper()
+      .setPropertyNamingStrategy(PropertyNamingStrategy.CAMEL_CASE_TO_LOWER_CASE_WITH_UNDERSCORES)
+      .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+      .configure(JsonParser.Feature.ALLOW_COMMENTS, true);
+
+  private static final URL DEFAULT_OPERATION_PARAMETER_WHITELIST =
+      AwsSdkClientTracer.class.getResource("/io/opentelemetry/instrumentation/auto/awssdk/v1_11/DefaultOperationParameterWhitelist.json");
+
+  private static final String GETTER_METHOD_NAME_PREFIX = "get";
+
+  private static final String TO_SNAKE_CASE_REGEX = "([a-z])([A-Z]+)";
+  private static final String TO_SNAKE_CASE_REPLACE = "$1_$2";
+
   private final Map<String, String> serviceNames = new ConcurrentHashMap<>();
   private final Map<Class, String> operationNames = new ConcurrentHashMap<>();
+  private AWSServiceHandlerManifest awsServiceHandlerManifest;
 
-  public AwsSdkClientTracer() {}
+  public AwsSdkClientTracer() {
+    initRequestManifest();
+  }
+
+  private void initRequestManifest() {
+    try {
+      awsServiceHandlerManifest = MAPPER.readValue(
+          DEFAULT_OPERATION_PARAMETER_WHITELIST, AWSServiceHandlerManifest.class);
+    } catch (IOException e) {
+      log.error("Unable to parse default operation parameter whitelist at "
+          + DEFAULT_OPERATION_PARAMETER_WHITELIST.getPath()
+          + ". This will affect this handler's ability to capture AWS operation parameter information.", e);
+    }
+  }
 
   @Override
   public String spanNameForRequest(Request<?> request) {
@@ -72,6 +115,9 @@ public class AwsSdkClientTracer extends HttpClientTracer<Request<?>, Request<?>,
       span.setAttribute("aws.stream.name", requestMeta.getStreamName());
       span.setAttribute("aws.table.name", requestMeta.getTableName());
     }
+
+    span.setAttributes(extractRequestParameters(request));
+
     return span;
   }
 
@@ -142,5 +188,77 @@ public class AwsSdkClientTracer extends HttpClientTracer<Request<?>, Request<?>,
   @Override
   protected String getInstrumentationName() {
     return "io.opentelemetry.auto.aws-sdk-1.11";
+  }
+
+
+  private static String toSnakeCase(String camelCase) {
+    return camelCase.replaceAll(TO_SNAKE_CASE_REGEX, TO_SNAKE_CASE_REPLACE).toLowerCase();
+  }
+
+  private Map<String, Object> extractRequestParameters(Request<?> request) {
+    HashMap<String, Object> ret = new HashMap<>();
+    if (null == awsServiceHandlerManifest) {
+      return ret;
+    }
+
+    AWSOperationHandlerManifest serviceHandler =
+        awsServiceHandlerManifest.getOperationHandlerManifest(extractServiceName(request));
+    if (null == serviceHandler) {
+      return ret;
+    }
+
+    AWSOperationHandler operationHandler = serviceHandler.getOperationHandler(extractOperationName(request));
+    if (null == operationHandler) {
+      return ret;
+    }
+
+    Object originalRequest = request.getOriginalRequest();
+
+    if (null != operationHandler.getRequestParameters()) {
+      operationHandler.getRequestParameters().forEach(parameterName -> {
+        try {
+          Object parameterValue = originalRequest
+              .getClass().getMethod(GETTER_METHOD_NAME_PREFIX + parameterName).invoke(originalRequest);
+          if (null != parameterValue) {
+            ret.put(toSnakeCase(parameterName), parameterValue);
+          }
+        } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException e) {
+          log.error("Error getting request parameter: " + parameterName, e);
+        }
+      });
+    }
+
+    if (null != operationHandler.getRequestDescriptors()) {
+      operationHandler.getRequestDescriptors().forEach((requestKeyName, requestDescriptor) -> {
+        try {
+          if (requestDescriptor.isMap() && requestDescriptor.shouldGetKeys()) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> parameterValue =
+                (Map<String, Object>) originalRequest
+                    .getClass()
+                    .getMethod(GETTER_METHOD_NAME_PREFIX + requestKeyName).invoke(originalRequest);
+            if (null != parameterValue) {
+              String renameTo =
+                  null != requestDescriptor.getRenameTo() ? requestDescriptor.getRenameTo() : requestKeyName;
+              ret.put(toSnakeCase(renameTo), parameterValue.keySet());
+            }
+          } else if (requestDescriptor.isList() && requestDescriptor.shouldGetCount()) {
+            @SuppressWarnings("unchecked")
+            List<Object> parameterValue =
+                (List<Object>) originalRequest
+                    .getClass().getMethod(GETTER_METHOD_NAME_PREFIX + requestKeyName).invoke(originalRequest);
+            if (null != parameterValue) {
+              String renameTo =
+                  null != requestDescriptor.getRenameTo() ? requestDescriptor.getRenameTo() : requestKeyName;
+              ret.put(toSnakeCase(renameTo), parameterValue.size());
+            }
+          }
+        } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException | ClassCastException e) {
+          log.error("Error getting request parameter: " + requestKeyName, e);
+        }
+      });
+    }
+
+    return ret;
   }
 }

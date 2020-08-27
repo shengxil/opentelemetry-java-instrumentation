@@ -46,6 +46,7 @@ configurations {
 
 dependencies {
   library group: 'com.amazonaws', name: 'aws-java-sdk-core', version: '1.11.0'
+  library group: 'com.amazonaws', name: 'aws-xray-recorder-sdk-aws-sdk-core', version: '2.6.1'
 
   // Include httpclient instrumentation for testing because it is a dependency for aws-sdk.
   testImplementation project(':instrumentation:apache-httpclient:apache-httpclient-4.0')
